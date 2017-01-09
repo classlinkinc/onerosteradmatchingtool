@@ -11,7 +11,9 @@ using OneRosterMatchingTool.Objects;
 using System.DirectoryServices.ActiveDirectory;
 using System.Text;
 using System.Threading;
-using OAuth;
+using System.Threading.Tasks;
+using System.Net.Http;
+using OneRosterOAuth;
 
 namespace OneRosterMatchingTool
 {
@@ -37,9 +39,6 @@ namespace OneRosterMatchingTool
             // filter by active and only take needed fields
             _options = "&filter=status%3D%27active%27&fields=username%2CsourcedId%2CgivenName%2CfamilyName%2Crole%2Cemail";
 
-            // begin oauth config
-            _oauth = new Manager();
-
             // initialize placeholder
             oneUrl.Text = OneUrlPlaceholder;
 
@@ -49,7 +48,7 @@ namespace OneRosterMatchingTool
 
         private readonly string _options;
         private readonly List<string> _domainList;
-        private readonly Manager _oauth;
+        private OneRosterConnection _oneRoster;
         private List<OneUser> _missingList;
         private List<OneUser> _foundList;
         private List<OneUser> _oneRosterList;
@@ -115,9 +114,8 @@ namespace OneRosterMatchingTool
                 return;
             }
 
-            // set params in oauth
-            _oauth["consumer_key"] = oneKey.Text;
-            _oauth["consumer_secret"] = oneSecret.Text;
+            // start oneRosterConnection
+            _oneRoster = new OneRosterConnection(oneKey.Text, oneSecret.Text);
 
             // reset list
             _missingList = new List<OneUser>();
@@ -146,23 +144,17 @@ namespace OneRosterMatchingTool
             {
                 // get total count before getting all users
                 var uri = $"{oneUrl.Text.TrimEnd('/')}/users?limit=1&filter=status%3D%27active%27";
+                var getTask = _oneRoster.makeRequest(uri);
+                Task.WaitAll(getTask);
+                HttpResponseMessage response = getTask.Result;
                 int totalNumUsers;
-                var authzHeader = _oauth.generateAuthzHeader(uri, "GET");
-                var webRequest = (HttpWebRequest)WebRequest.Create(uri);
-                webRequest.Method = "GET";
-                webRequest.ContentType = "application/json";
-                webRequest.ContentLength = 0;
-                webRequest.Headers.Add("Authorization", authzHeader);
-                using (var response = (HttpWebResponse)webRequest.GetResponse())
+                if (response.StatusCode == HttpStatusCode.OK)
                 {
-                    if (response.StatusCode == HttpStatusCode.OK)
-                    {
-                        int.TryParse(response.Headers.GetValues("X-Total-Count")?.FirstOrDefault(), result: out totalNumUsers);
-                    }
-                    else
-                    {
-                        throw new Exception(response.StatusCode.ToString());
-                    }
+                    int.TryParse(response.Headers.GetValues("X-Total-Count")?.FirstOrDefault(), result: out totalNumUsers);
+                }
+                else
+                {
+                    throw new Exception(response.StatusCode.ToString());
                 }
                 
                 // update form with number of users
@@ -191,33 +183,29 @@ namespace OneRosterMatchingTool
                     }));
                     // create next url
                     uri = $"{oneUrl.Text.TrimEnd('/')}/users?limit={limit}&offset={currentOffset}&{_options}";
-                    authzHeader = _oauth.generateAuthzHeader(uri, "GET");
-                    webRequest = (HttpWebRequest) WebRequest.Create(uri);
-                    webRequest.Method = "GET";
-                    webRequest.ContentType = "application/json";
-                    webRequest.ContentLength = 0;
-                    webRequest.Headers.Add("Authorization", authzHeader);
-                    using (var response = (HttpWebResponse)webRequest.GetResponse())
-                    using (Stream stream = response.GetResponseStream())
-                        if (stream != null)
-                            using (var reader = new StreamReader(stream))
-                            {
-                                var tempList = JsonConvert.DeserializeObject<OneRoster>(reader.ReadToEnd());
-                                foreach (OneUser usr in tempList.user)
-                                {
-                                    userList.Add(usr);
-                                    Invoke(new Action(() =>
-                                    {
-                                        statusProgressBar.PerformStep();
-                                        storedUsers_label.Text = (int.Parse(storedUsers_label.Text)+1).ToString();
-                                    }));
-                                }
-                                currentOffset += limit;
-                                if (limit + currentOffset > totalNumUsers)
-                                {
-                                    limit = totalNumUsers - currentOffset;
-                                }
-                            }
+                    getTask = _oneRoster.makeRequest(uri);
+                    Task.WaitAll(getTask);
+                    response = getTask.Result;
+
+                    // get result string
+                    var readResult = response.Content.ReadAsStringAsync();
+                    Task.WaitAll(readResult);
+                    var returnString = readResult.Result;
+                    var tempList = JsonConvert.DeserializeObject<OneRoster>(returnString);
+                    foreach (OneUser usr in tempList.user)
+                    {
+                        userList.Add(usr);
+                        Invoke(new Action(() =>
+                        {
+                            statusProgressBar.PerformStep();
+                            storedUsers_label.Text = (int.Parse(storedUsers_label.Text) + 1).ToString();
+                        }));
+                    }
+                    currentOffset += limit;
+                    if (limit + currentOffset > totalNumUsers)
+                    {
+                        limit = totalNumUsers - currentOffset;
+                    }
                 }
                 return userList;
             }
@@ -365,15 +353,14 @@ namespace OneRosterMatchingTool
             try
             {
                 var uri = $"{oneUrl.Text.TrimEnd('/')}/users?limit=1";
-                var authzHeader = _oauth.generateAuthzHeader(uri, "GET");
-                var webRequest = (HttpWebRequest) WebRequest.Create(uri);
-                webRequest.Method = "GET";
-                webRequest.ContentType = "application/json";
-                webRequest.ContentLength = 0;
-                webRequest.Headers.Add("Authorization", authzHeader);
-                using (var res = (HttpWebResponse) webRequest.GetResponse())
-                {
+                var getTask = _oneRoster.makeRequest(uri);
+                Task.WaitAll(getTask);
+                HttpResponseMessage response = getTask.Result;
+                if (response.StatusCode == HttpStatusCode.OK)
                     MessageBox.Show(@"OneRoster Connection Established");
+                else
+                {
+                    throw new Exception(response.StatusCode.ToString(), null);
                 }
             }
             catch(Exception a)
@@ -400,8 +387,7 @@ namespace OneRosterMatchingTool
         private void testOR_Click(object sender, EventArgs e)
         {
             // set params in oauth
-            _oauth["consumer_key"] = oneKey.Text;
-            _oauth["consumer_secret"] = oneSecret.Text;
+            _oneRoster = new OneRosterConnection(oneKey.Text, oneSecret.Text);
             testOR.Enabled = false;
             orTestWorker.RunWorkerAsync();
         }
@@ -467,7 +453,9 @@ namespace OneRosterMatchingTool
         {
             createCSV.Enabled = false;
             var fileName = DateTime.Now.ToString("yyyy.MM.dd.HH.mm.ss")+".csv";
+            _missingMutex.WaitOne();
             var csvText = createCsvTextFile(_missingList);
+            _missingMutex.ReleaseMutex();
             TextWriter tw = new StreamWriter(fileName, true);
             tw.Write(csvText, true);
             tw.Close();
